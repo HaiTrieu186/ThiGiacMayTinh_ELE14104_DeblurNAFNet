@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 """
-STEP 6: Giao Diện Web Demo (Gradio) — Fixed Version
-=====================================================
-Thay đổi so với version cũ:
-  ✅ Thêm slider điều chỉnh cường độ sharpen
-  ✅ Hiển thị 4 ảnh so sánh (thêm cột Sharpened)
-  ✅ Thêm CLAHE checkbox
-  ✅ Thêm nút Download kết quả
-
-Cài Gradio (1 lần):
-    pip install gradio
-
-Chạy:
-    python scripts/step6_app.py --checkpoint pretrained/nafnet_cards_best.pth
-
-Mở trình duyệt: http://localhost:7860
+STEP 6: Giao Diện Web Demo (Gradio) — v2.2
+==========================================
+  ✅ Nút "Tạo Blur Thử" — blur ảnh sắc nét để test tại chỗ
+  ✅ Slider chọn loại blur (motion / defocus / gaussian)
+  ✅ Slider chọn mức độ blur (nhẹ / vừa / nặng)
 """
 
 import cv2
@@ -34,7 +24,7 @@ def load_model(checkpoint_path):
     try:
         from basicsr.models.archs.NAFNet_arch import NAFNet
     except ImportError:
-        raise RuntimeError("NAFNet chưa cài! Chạy: cd NAFNet && pip install -e .")
+        raise RuntimeError("NAFNet chưa cài!")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -105,7 +95,6 @@ def nafnet_infer(model, device, img_bgr):
 
 # ── Unsharp masking ──────────────────────────────────────────
 def unsharp_mask(img, amount=0.6, radius=1.0):
-    """Tăng độ nét bằng unsharp masking."""
     if amount <= 0:
         return img
     ksize = int(6 * radius + 1) | 1
@@ -115,7 +104,6 @@ def unsharp_mask(img, amount=0.6, radius=1.0):
 
 
 def clahe_enhance(img):
-    """CLAHE contrast enhancement."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -123,12 +111,70 @@ def clahe_enhance(img):
     return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
 
 
-# ── Hàm xử lý chính ─────────────────────────────────────────
+# ── TẠO BLUR THỬ ────────────────────────────────────────────
+def make_blur(pil_image, blur_type, blur_level):
+    """
+    Tạo blur nhân tạo lên ảnh sắc nét để test.
+    blur_type : "Motion", "Defocus", "Gaussian"
+    blur_level: 1 (nhẹ) → 3 (nặng)
+    """
+    if pil_image is None:
+        return None, "⚠️ Chưa upload ảnh!"
+
+    img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    # Map level → kernel size
+    level_map = {
+        1: {"motion": 7,  "defocus": 2, "gaussian": 1.2},
+        2: {"motion": 13, "defocus": 4, "gaussian": 2.2},
+        3: {"motion": 21, "defocus": 6, "gaussian": 3.5},
+    }
+    level = int(blur_level)
+    params = level_map.get(level, level_map[2])
+
+    if blur_type == "Motion":
+        size  = params["motion"]
+        angle = 45  # góc cố định để dễ thấy
+        k = np.zeros((size, size), dtype=np.float32)
+        center = size // 2
+        import math
+        rad = math.radians(angle)
+        for i in range(size):
+            offset = i - center
+            x = int(round(center + offset * math.cos(rad)))
+            y = int(round(center + offset * math.sin(rad)))
+            if 0 <= x < size and 0 <= y < size:
+                k[y, x] = 1.0
+        total = k.sum()
+        k = k / total if total > 0 else k
+        blurred = cv2.filter2D(img, -1, k)
+        desc = f"Motion blur (kernel {size}px, angle 45°)"
+
+    elif blur_type == "Defocus":
+        r    = params["defocus"]
+        size = 2 * r + 1
+        k    = np.zeros((size, size), dtype=np.float32)
+        cv2.circle(k, (r, r), r, 1.0, -1)
+        k    = k / k.sum()
+        blurred = cv2.filter2D(img, -1, k)
+        desc = f"Defocus blur (radius {r}px)"
+
+    else:  # Gaussian
+        sigma = params["gaussian"]
+        ksize = int(6 * sigma + 1) | 1
+        blurred = cv2.GaussianBlur(img, (ksize, ksize), sigma)
+        desc = f"Gaussian blur (sigma {sigma})"
+
+    # Thêm noise nhẹ cho realistic
+    noise   = np.random.normal(0, 2.0, img.shape).astype(np.float32)
+    blurred = np.clip(blurred.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    result_pil = Image.fromarray(cv2.cvtColor(blurred, cv2.COLOR_BGR2RGB))
+    return result_pil, f"✅ Đã tạo: {desc}\nBây giờ bấm 🚀 Chạy Deblur để xem kết quả!"
+
+
+# ── Hàm xử lý deblur chính ──────────────────────────────────
 def process(pil_image, use_perspective, sharpen_amount, use_clahe):
-    """
-    Input:  PIL Image + settings từ Gradio
-    Output: 4 ảnh PIL + status text + path file kết quả
-    """
     if pil_image is None:
         return None, None, None, None, "⚠️ Chưa upload ảnh!", None
 
@@ -151,12 +197,10 @@ def process(pil_image, use_perspective, sharpen_amount, use_clahe):
     if use_clahe:
         sharpened = clahe_enhance(sharpened)
 
-    # BGR → RGB
-    rect_rgb     = cv2.cvtColor(rectified, cv2.COLOR_BGR2RGB)
-    deblur_rgb   = cv2.cvtColor(deblurred, cv2.COLOR_BGR2RGB)
-    sharpen_rgb  = cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)
+    rect_rgb    = cv2.cvtColor(rectified, cv2.COLOR_BGR2RGB)
+    deblur_rgb  = cv2.cvtColor(deblurred, cv2.COLOR_BGR2RGB)
+    sharpen_rgb = cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)
 
-    # Lưu file tạm để download
     tmp_path = os.path.join(tempfile.gettempdir(), "deblur_result.png")
     cv2.imwrite(tmp_path, sharpened)
 
@@ -188,54 +232,72 @@ def build_ui():
     with gr.Blocks(title="Card Deblur Demo", theme=gr.themes.Soft()) as demo:
 
         gr.Markdown("""
-        # 🃏 Card Deblur — NAFNet Demo (Fixed)
+        # 🃏 Card Deblur — NAFNet Demo
         Upload ảnh thẻ bị mờ → model tự sửa góc → khôi phục nét → tăng sắc.
 
-        **Hoạt động tốt với:** Bài tây, Yugioh card, CCCD, thẻ ngân hàng, thẻ tên...
+        **Hoạt động tốt với:** Bài tây, Yugioh, CCCD, thẻ ngân hàng...
         """)
 
         with gr.Row():
             # ── Cột trái: Controls ─────────────────────────
             with gr.Column(scale=1):
-                inp_image   = gr.Image(type="pil", label="📤 Upload ảnh blur")
+                inp_image = gr.Image(type="pil", label="📤 Upload ảnh")
 
-                gr.Markdown("### ⚙️ Settings")
-                use_persp   = gr.Checkbox(value=True,
-                                          label="🔲 Tự động sửa góc (Perspective Correction)")
-                sharpen_sl  = gr.Slider(minimum=0.0, maximum=1.5, value=0.6, step=0.1,
-                                        label="✨ Cường độ Sharpen (0=tắt, 0.6=mặc định, 1.5=mạnh)")
-                use_clahe   = gr.Checkbox(value=False,
-                                          label="🎨 CLAHE Contrast Enhancement (dùng nếu ảnh tối)")
+                # ── Blur thử (optional) ──────────────────
+                gr.Markdown("### 🧪 Tạo Blur Thử (nếu ảnh chưa blur)")
+                gr.Markdown("*Upload ảnh sắc nét → chọn loại blur → bấm nút → ảnh blur tự điền vào ô trên*")
+                blur_type  = gr.Radio(
+                    choices=["Motion", "Defocus", "Gaussian"],
+                    value="Motion",
+                    label="Loại blur"
+                )
+                blur_level = gr.Slider(
+                    minimum=1, maximum=3, value=2, step=1,
+                    label="Mức độ blur (1=nhẹ, 2=vừa, 3=nặng)"
+                )
+                blur_btn   = gr.Button("🌀 Tạo Blur Thử", variant="secondary")
+                blur_msg   = gr.Textbox(label="", lines=2, interactive=False)
 
-                run_btn     = gr.Button("🚀 Chạy Deblur", variant="primary", size="lg")
-                status_box  = gr.Textbox(label="📋 Trạng thái", lines=4, interactive=False)
-                dl_file     = gr.File(label="💾 Download kết quả (.png)")
+                gr.Markdown("---")
+
+                # ── Deblur settings ──────────────────────
+                gr.Markdown("### ⚙️ Settings Deblur")
+                use_persp  = gr.Checkbox(value=True,
+                                         label="🔲 Tự động sửa góc (Perspective)")
+                sharpen_sl = gr.Slider(minimum=0.0, maximum=1.5, value=0.6, step=0.1,
+                                       label="✨ Sharpen (0=tắt, 0.6=mặc định, 1.5=mạnh)")
+                use_clahe  = gr.Checkbox(value=False,
+                                         label="🎨 CLAHE (bật nếu ảnh tối)")
+
+                run_btn    = gr.Button("🚀 Chạy Deblur", variant="primary", size="lg")
+                status_box = gr.Textbox(label="📋 Trạng thái", lines=4, interactive=False)
+                dl_file    = gr.File(label="💾 Download kết quả")
 
             # ── Cột phải: Kết quả ─────────────────────────
             with gr.Column(scale=3):
                 with gr.Row():
-                    out_input  = gr.Image(label="📷 Ảnh gốc (input)")
+                    out_input  = gr.Image(label="📷 Input")
                     out_rect   = gr.Image(label="📐 Sau sửa góc")
                 with gr.Row():
-                    out_deblur = gr.Image(label="🔍 Sau Deblur (NAFNet)")
-                    out_sharp  = gr.Image(label="✨ Sau Sharpen (Final)")
+                    out_deblur = gr.Image(label="🔍 Sau Deblur")
+                    out_sharp  = gr.Image(label="✨ Final (Deblur + Sharpen)")
 
         gr.Markdown("""
         ---
-        ### 📖 Hướng dẫn
-        1. Upload ảnh thẻ bị mờ (jpg/png)
-        2. Điều chỉnh settings nếu cần:
-           - **Sửa góc**: bật nếu ảnh chụp xiên, tắt nếu ảnh đã thẳng
-           - **Sharpen**: tăng nếu chữ vẫn còn hơi mờ, **giảm** nếu ảnh bị quá sắc/nhiễu
-           - **CLAHE**: bật nếu ảnh tối, thiếu contrast
-        3. Bấm **Chạy Deblur**
-        4. Cột **Sau Sharpen** là kết quả cuối cùng để dùng
+        ### 💡 Cách dùng nhanh
+        **Có sẵn ảnh blur:** Upload → Chạy Deblur luôn
 
-        ### 💡 Tips
-        - Sharpen 0.4–0.6: phù hợp cho hầu hết trường hợp
-        - Sharpen 0.8–1.0: dùng khi chữ vẫn mờ sau deblur
-        - Sharpen > 1.2: có thể tạo nhiễu quanh cạnh chữ
+        **Ảnh sắc nét muốn test:** Upload → Chọn loại blur + mức độ → Bấm Tạo Blur Thử → Bấm Chạy Deblur
+
+        **Sharpen:** 0.4–0.6 cho hầu hết trường hợp | 0.8–1.0 nếu chữ vẫn mờ | >1.2 có thể tạo nhiễu
         """)
+
+        # ── Events ──────────────────────────────────────
+        blur_btn.click(
+            fn=make_blur,
+            inputs=[inp_image, blur_type, blur_level],
+            outputs=[inp_image, blur_msg]
+        )
 
         run_btn.click(
             fn=process,
@@ -251,8 +313,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--port",  type=int, default=7860)
-    parser.add_argument("--share", action="store_true",
-                        help="Tạo public link để demo online")
+    parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
     ckpt = Path(args.checkpoint)
